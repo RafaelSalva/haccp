@@ -32,6 +32,40 @@ def parse_data_forn(txt: str) -> datetime | None:
 # --------------------------------------------------------------------
 st.set_page_config(page_title="HCCP - Validades", page_icon="🧾", layout="centered")
 
+## ----------------------
+# Tela inicial
+# ----------------------
+if "iniciado" not in st.session_state:
+    st.session_state.iniciado = False
+
+if not st.session_state.iniciado:
+    st.title("Validades HACCP dos Frescos ")
+
+    st.markdown(
+        """
+        Bem-vindo ao sistema de **Validades HACCP**!  
+
+        Sou **Rafael Cavalcante Salvador**, colaborador da **secção dos frescos no Continente Bom Dia Santo Amaro (Oeiras)**
+        e atualmente estudante de um curso profissional de Programação em Python.  
+
+        Durante a rotina de trabalho, percebi que a elaboração das validades HACCP, feita manualmente, podia gerar erros e retrabalho.
+        Pensando nisso, desenvolvi este programa com o objetivo de **tornar o processo mais ágil, fiável e acessível** para toda a equipa.
+
+        A aplicação permite calcular e gerar validades HACCP de forma simples e intuitiva, reduzindo falhas humanas e garantindo que
+        mesmo colaboradores com menos experiência na secção consigam realizar o procedimento de maneira correta.
+
+        Este projeto une a prática do dia a dia no setor de frescos com os conhecimentos que venho adquirindo em programação,
+        e espero que seja útil no apoio à rotina e no reforço da qualidade e segurança alimentar.
+        """
+    )
+
+    if st.button("👉 Iniciar aplicação", type="primary"):
+        st.session_state.iniciado = True
+        st.rerun()
+
+    # 🔒 Impede que o resto do script rode antes de clicar em "Iniciar"
+    st.stop()
+
 
 # --------------------------------------------------------------------
 # 2) LOCALIZAÇÃO DO ARQUIVO EXCEL
