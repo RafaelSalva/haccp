@@ -9,6 +9,11 @@ import os
 
 import pandas as pd
 import streamlit as st
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Lisbon")
+
+
 
 def parse_data_forn(txt: str) -> datetime | None:
     if not txt:
@@ -20,7 +25,7 @@ def parse_data_forn(txt: str) -> datetime | None:
             dt = datetime.strptime(txt, f)
             if f in ("%d/%m/%Y", "%d/%m/%y"):
                 dt = datetime.combine(dt.date(), time(23, 59, 59))
-            return dt
+            return dt.replace(tzinfo=TZ)
         except ValueError:
             continue
     return None
@@ -65,7 +70,6 @@ if not st.session_state.iniciado:
 
     # 🔒 Impede que o resto do script rode antes de clicar em "Iniciar"
     st.stop()
-
 
 # --------------------------------------------------------------------
 # 2) LOCALIZAÇÃO DO ARQUIVO EXCEL
@@ -205,7 +209,7 @@ OBS: {self.obs or ''}
         executar.val_for = st.text_input("Digite a validade do fornecedor:", key="hccp_val_for")
 
         # 3) Momento atual (usado tanto para exibir quanto para calcular validade)
-        executar.agora = datetime.now()
+        executar.agora = datetime.now(TZ)
 
         # 4) Ao clicar em “Gerar Validade” calculamos a validade e montamos o bloco
         if st.button("Gerar Validade", type="primary"):
@@ -227,7 +231,7 @@ OBS: {self.obs or ''}
                     if "produto do dia" in texto:
                         # Até 23:59:59 do dia atual
                         executar.validade = datetime(
-                            executar.agora.year, executar.agora.month, executar.agora.day, 23, 59, 59
+                            executar.agora.year, executar.agora.month, executar.agora.day, 23, 59, 59, tzinfo=TZ
                         )
                     elif dias:
                         executar.validade = executar.agora + timedelta(days=int(dias.group(1)))
@@ -235,6 +239,20 @@ OBS: {self.obs or ''}
                         executar.validade = executar.agora + timedelta(hours=int(horas.group(1)))
                     # Se não cair em nenhum caso, “validade” permanece None
                     break
+
+            # --- aplicar limite do fornecedor / ou usar só fornecedor se não houver "normal" ---
+            dt_forn = parse_data_forn(executar.val_for)
+
+            if dt_forn and executar.validade:
+                # fique com a data mais cedo (mais restritiva)
+                if dt_forn < executar.validade:
+                    executar.validade = dt_forn
+                    executar.obs = (executar.obs or "")
+                    if "Fornecedor limitou validade" not in executar.obs:
+                        executar.obs = (executar.obs + " | Fornecedor limitou validade").strip(" |")
+            elif dt_forn and not executar.validade:
+                # não houve regra "normal" -> use a data do fornecedor como validade final
+                executar.validade = dt_forn
 
             dt_forn = parse_data_forn(executar.val_for)
             if dt_forn and executar.val_for:
@@ -261,7 +279,7 @@ OBS: {self.obs or ''}
 
             elif not (executar.lote or "").strip():
                 st.warning("Informe o lote.")
-            
+
 
         # 6) Botão “Gerar nova validade”
         #    -> Limpa os inputs do usuário e esconde o bloco (zerando a validade),
