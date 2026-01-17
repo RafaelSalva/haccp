@@ -6,29 +6,403 @@
 import re
 from datetime import datetime, timedelta, time
 import os
-
+import io
 import pandas as pd
 import streamlit as st
 from zoneinfo import ZoneInfo
+from PIL import Image
+import numpy as np
+import cv2
+import pytesseract
+from rapidfuzz import process, fuzz
+import socket
+
+
+pytesseract.pytesseract.tesseract_cmd = "/opt/local/bin/tesseract"
+
 
 TZ = ZoneInfo("Europe/Lisbon")
 
+ZEBRAS = {
+    "ZQ1": {
+        "nome": "Zebra ZQ610 159",
+        "ip": "10.151.60.159",
+        "dpi": 203,
+    },
+    "ZQ2": {
+        "nome": "Zebra ZQ610 158",
+        "ip": "10.151.60.158",
+        "dpi": 203,
+    },
+    "ZQ3": {
+        "nome": "Zebra ZQ610 157",
+        "ip": "10.151.60.157",
+        "dpi": 203,
+    },
+
+}
+
+
+def normalizar_nome_produto(txt: str) -> str:
+    if not txt:
+        return ""
+
+    s = txt.lower().strip()
+
+    # remove coisas entre parênteses (ex: (CDP), (200-600G), etc.)
+    s = re.sub(r"\([^)]*\)", " ", s)
+
+    # remove pesos e unidades (ex: 120g, 1.280kg, 200-600g, 1280 g)
+    s = re.sub(r"\b\d+[.,]?\d*\s*(kg|g|gr|gramas)\b", " ", s)
+    s = re.sub(r"\b\d+\s*-\s*\d+\s*(kg|g|gr)\b", " ", s)
+
+    # remove números soltos
+    s = re.sub(r"\b\d+\b", " ", s)
+
+    # remove pontuação extra
+    s = re.sub(r"[^a-zà-ÿ\s]", " ", s)
+
+    # normaliza espaços
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s
+
+
+def preprocess_gray(pil_img: Image.Image) -> np.ndarray:
+    img = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # Aumenta tamanho para OCR (muito importante)
+    h, w = gray.shape[:2]
+    scale = 2 if max(h, w) < 1400 else 1.5
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # Contraste local
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # Reduz ruído leve
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    return gray
+
+
+def preprocess_thresh(pil_img: Image.Image) -> np.ndarray:
+    gray = preprocess_gray(pil_img)
+
+    # Threshold adaptativo (melhor em sombras)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 7
+    )
+
+    # Limpeza leve
+    kernel = np.ones((2, 2), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+    return th
+
+
+def ocr_best_of_two(pil_img: Image.Image) -> str:
+    # OCR em dois modos e escolhe o melhor
+    config = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+
+    t1 = pytesseract.image_to_string(preprocess_gray(pil_img), lang="por", config=config) or ""
+    t2 = pytesseract.image_to_string(preprocess_thresh(pil_img), lang="por", config=config) or ""
+
+    return t1 if len(t1) >= len(t2) else t2
+
+
+def auto_crop_document(pil_img: Image.Image) -> Image.Image:
+    """
+    Tenta detectar o maior retângulo (papel) e recortar.
+    Se falhar, devolve a imagem original.
+    """
+    img = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # suaviza e detecta bordas
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    # fecha pequenos buracos nas bordas
+    kernel = np.ones((5, 5), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    edges = cv2.erode(edges, kernel, iterations=1)
+
+    # encontra contornos
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return pil_img
+
+    # pega o maior contorno
+    cnt = max(cnts, key=cv2.contourArea)
+
+    # recorte por bounding box (simples e robusto)
+    x, y, w, h = cv2.boundingRect(cnt)
+
+    # evita recortes muito pequenos (falha)
+    H, W = gray.shape[:2]
+    if w < 0.3 * W or h < 0.3 * H:
+        return pil_img
+
+    cropped = img[y:y+h, x:x+w]
+    return Image.fromarray(cropped)
+
+
+def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
+    img = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # AUMENTA tamanho (OCR melhora muito)
+    h, w = gray.shape[:2]
+    scale = 2 if max(h, w) < 1200 else 1.5
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # Aumenta contraste local
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # Remove ruído leve
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Binarização adaptativa (melhor em papel com sombras)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 7
+    )
+
+    # Pequena "limpeza" morfológica
+    kernel = np.ones((2, 2), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    return th
+
+
+def ocr_image_to_text(pil_img: Image.Image) -> str:
+    processed = preprocess_for_ocr(pil_img)
+
+    # 6 = bloco de texto; 4 também é bom para "colunas"
+    config = "--oem 1 --psm 6"
+
+    text = pytesseract.image_to_string(processed, lang="por", config=config)
+    return text or ""
+
+
+def extrair_nome_do_padroes(linhas: list[str]) -> str | None:
+    """
+    Extrai o nome após 'Denominação Comercial' (mesma linha ou em duas linhas),
+    até antes de 'Nome Científico' (ou outras seções).
+    """
+    if not linhas:
+        return None
+
+    low = [l.lower().strip() for l in linhas]
+
+    start_idx = None
+
+    # Caso A: "denominação comercial" na mesma linha
+    for i, l in enumerate(low):
+        if "denomina" in l and "comercial" in l:
+            start_idx = i + 1
+            break
+
+    # Caso B: "denominação" numa linha e "comercial" na seguinte
+    if start_idx is None:
+        for i in range(len(low) - 1):
+            if "denomina" in low[i] and "comercial" in low[i + 1]:
+                start_idx = i + 2
+                break
+
+    if start_idx is None:
+        return None
+
+    nome_partes = []
+    for j in range(start_idx, len(linhas)):
+        lj = low[j]
+        if not linhas[j].strip():
+            break
+        # para quando chegar em outras secções
+        if ("nome cient" in lj or "método" in lj or "metodo" in lj or
+            "país" in lj or "pais" in lj or "lote" in lj):
+            break
+
+        nome_partes.append(linhas[j].strip())
+
+    nome = " ".join(nome_partes).strip()
+    return nome if nome else None
+
+
+def extrair_lote(linhas: list[str]) -> str | None:
+    for l in linhas:
+        m = re.search(r"\blote\b\s*[:\-]?\s*([A-Z0-9]+)", l, flags=re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def extrair_validade_ultimos4(linhas: list[str]) -> str | None:
+    """
+    Regra que você passou:
+    - validade está na ÚLTIMA linha
+    - são os últimos 4 números
+    - 0000 => avaliação macroscópica
+    - ex: 1804 => 18/04
+    """
+    # pega última linha "com conteúdo"
+    ultima = None
+    for l in reversed(linhas):
+        if l.strip():
+            ultima = l.strip()
+            break
+    if not ultima:
+        return None
+
+    # captura últimos 4 dígitos do fim (ignora pontos e letras)
+    m = re.search(r"(\d{4})\D*$", ultima)
+    if not m:
+        # fallback: procura qualquer grupo de 4 dígitos no fim do texto
+        joined = " ".join(linhas)
+        m = re.search(r"(\d{4})\D*$", joined)
+        if not m:
+            return None
+
+    ult4 = m.group(1)
+
+    if ult4 == "0000":
+        return "avaliação macroscópica"
+
+    # ddmm -> dd/mm
+    dd = ult4[:2]
+    mm = ult4[2:]
+    return f"{dd}/{mm}"
+
+
+def sugerir_produto_catalogo(nome_extraido: str, produtos: list["Produto"]) -> str | None:
+    if not nome_extraido:
+        return None
+
+    nome_norm = normalizar_nome_produto(nome_extraido)
+
+    catalogo = [p.nome for p in produtos if p.nome]
+    if not catalogo:
+        return None
+
+    # também normaliza o catálogo para comparar "igual com igual"
+    catalogo_norm = {p.nome: normalizar_nome_produto(p.nome) for p in produtos if p.nome}
+
+    # fuzzy match em cima das versões normalizadas
+    escolhas = list(catalogo_norm.values())
+    melhor_norm, score, idx = process.extractOne(
+        nome_norm,
+        escolhas,
+        scorer=fuzz.WRatio
+    )
+
+    # recupera o nome ORIGINAL do catálogo correspondente ao "melhor_norm"
+    nome_original = None
+    for original, norm in catalogo_norm.items():
+        if norm == melhor_norm:
+            nome_original = original
+            break
+
+    return nome_original if score >= 80 else None
 
 
 def parse_data_forn(txt: str) -> datetime | None:
     if not txt:
         return None
-    txt = txt.strip()
-    fmts = ["%d/%m/%Y %H:%M", "%d/%m/%Y", "%d/%m/%y"]
+
+    txt = txt.strip().lower()
+
+    # caso especial
+    if "avalia" in txt and "macro" in txt:
+        return None
+
+    fmts = ["%d/%m/%Y %H:%M", "%d/%m/%Y", "%d/%m/%y", "%d/%m"]  # <- adicionado "%d/%m"
+
     for f in fmts:
         try:
             dt = datetime.strptime(txt, f)
-            if f in ("%d/%m/%Y", "%d/%m/%y"):
+
+            # Se vier sem ano (%d/%m), usa o ano atual (heurística)
+            if f == "%d/%m":
+                now = datetime.now(TZ)
+                dt = dt.replace(year=now.year)
+
+                # se a data já "passou" muito, assume próximo ano
+                # (ajuda em virada de ano / etiquetas do início do ano)
+                candidate = dt.replace(tzinfo=TZ)
+                if candidate < now - timedelta(days=7):
+                    dt = dt.replace(year=now.year + 1)
+
+            if f in ("%d/%m/%Y", "%d/%m/%y", "%d/%m"):
                 dt = datetime.combine(dt.date(), time(23, 59, 59))
+
             return dt.replace(tzinfo=TZ)
+
         except ValueError:
             continue
+
     return None
+
+#impressão com a Zebra
+
+
+def cm_to_dots(cm: float, dpi: int) -> int:
+    inches = cm / 2.54
+    return int(round(inches * dpi))
+
+def build_haccp_zpl(executar: "Produto", dpi: int = 203) -> str:
+    pw = 640   # 8 cm
+    ll = 305   # 3.8 cm
+
+    lines = [
+        "VALIDADE HACCP",
+        f"PRODUTO: {executar.nome}",
+        f"LOTE: {executar.lote}",
+        f"VAL FORN: {executar.val_for}",
+        f"EXP: {executar.agora.strftime('%d/%m %H:%M')}",
+        f"VAL: {executar.validade.strftime('%d/%m %H:%M')}",
+    ]
+
+    if executar.obs:
+        lines.append(f"OBS: {executar.obs}")
+
+    text = "\\&".join(lines)  # quebra de linha ZPL
+
+    zpl = f"""
+^XA
+^CI28
+^PW{pw}
+^LL{ll}
+^LH0,0
+
+^FO15,15
+^A0N,22,22
+^FB{pw-30},7,3,L,0
+^FD{text}^FS
+
+^XZ
+""".strip()
+
+    return zpl
+
+
+def send_zpl_to_zebra(ip: str, zpl: str, port: int = 9100, timeout: float = 3.0) -> None:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            s.sendall(zpl.encode("utf-8"))
+    except socket.timeout:
+        raise ConnectionError("A impressora não respondeu (timeout).")
+    except ConnectionRefusedError:
+        raise ConnectionError("Conexão recusada pela impressora.")
+    except OSError as e:
+        raise ConnectionError(f"Impressora não encontrada na rede ({ip}).")
+
+
 
 
 # --------------------------------------------------------------------
@@ -124,10 +498,7 @@ OBS: {self.obs}
             mime="text/plain",
         )
 
-        # Botão de imprimir
-        if st.button("Imprimir etiqueta", key=f"print_consulta_{hash(obj.nome)}"):
-            # st.toast exibe uma mensagem temporária
-            st.toast("Impressão ainda não está disponível. Em breve! 🖨️")
+
 
     # Tela de “Consultar produto” (busca por selectbox)
         # Tela de “Consultar produto” (busca por selectbox)
@@ -266,6 +637,34 @@ OBS: {self.obs or ''}
             st.success("Validade gerada com sucesso!")
             st.code(bloco, language="text")
 
+            # -------------------------
+            # IMPRESSÃO ZEBRA
+            # -------------------------
+            imp_id = st.selectbox(
+                "Impressora Zebra",
+                options=list(ZEBRAS.keys()),
+                format_func=lambda k: f"{k} - {ZEBRAS[k]['nome']}",
+            )
+
+            if st.button("Imprimir validade", key="btn_print_tab2"):
+                zebra = ZEBRAS[imp_id]
+                zpl = build_haccp_zpl(executar_tab3, dpi=zebra["dpi"])
+                try:
+                    send_zpl_to_zebra(zebra["ip"], zpl)
+                    st.success("Etiqueta enviada para a impressora com sucesso ✅")
+
+                except ConnectionError as e:
+                    st.warning(
+                        f"⚠️ Não foi possível imprimir.\n\n"
+                        f"Impressora: {zebra['nome']}\n"
+                        f"Motivo: {str(e)}\n\n"
+                        "Verifique se a impressora está ligada e conectada à rede."
+                    )
+
+                except Exception as e:
+                    st.error("❌ Erro inesperado ao tentar imprimir.")
+                    st.exception(e)
+
             # Baixar como TXT (nome do arquivo inclui produto + lote + val_for)
             st.download_button(
                 "Baixar como TXT",
@@ -273,11 +672,10 @@ OBS: {self.obs or ''}
                 file_name=f"HCCP_{executar.nome[:20].replace(' ', '_')}_{executar.lote}_{executar.val_for}.txt",
                 mime="text/plain",
             )
-            if st.button("Imprimir etiqueta", key=f"print_consulta_{executar.nome}"):
-                st.toast("Impressão ainda não está disponível. Em breve! 🖨️")
 
 
-            elif not (executar.lote or "").strip():
+
+            if not (executar.lote or "").strip():
                 st.warning("Informe o lote.")
 
 
@@ -355,9 +753,14 @@ produtos = para_lista_de_produtos(df_all, secao_escolhida)
 # 6) CICLO DE VIDA DO OBJETO 'executar'
 #    -> Criamos (uma vez) e reusamos entre interações via session_state
 # --------------------------------------------------------------------
-if "executar" not in st.session_state:
-    st.session_state.executar = Produto()   # rascunho “vazio”
-executar = st.session_state.executar        # atalho local para escrever menos
+if "executar_tab2" not in st.session_state:
+    st.session_state.executar_tab2 = Produto()
+
+if "executar_tab3" not in st.session_state:
+    st.session_state.executar_tab3 = Produto()
+
+executar_tab2 = st.session_state.executar_tab2
+executar_tab3 = st.session_state.executar_tab3
 
 
 # --------------------------------------------------------------------
@@ -373,10 +776,194 @@ Desenvolvido por Rafael Salvador
     language="text",
 )
 
-tab1, tab2 = st.tabs(["Consultar validade", "Gerar validade HACCP"])
+tab1, tab2, tab3 = st.tabs(["Consultar validade", "Gerar validade HACCP", "Gerar por foto"])
+
 
 with tab1:
     Produto.pesquisart(produtos)
 
 with tab2:
-    Produto.hccp_streamlit(executar, produtos)
+    Produto.hccp_streamlit(executar_tab2, produtos)
+
+
+with tab3:
+    st.subheader("Gerar validade por foto (rastreabilidade)")
+
+    # -------------------------
+    # ESTADO PERSISTENTE
+    # -------------------------
+    if "foto_bytes" not in st.session_state:
+        st.session_state.foto_bytes = None
+
+    if "foto_haccp_pronto" not in st.session_state:
+        st.session_state.foto_haccp_pronto = False
+
+    if "print_feedback" not in st.session_state:
+        # {'kind': 'success'|'warning'|'error', 'msg': '...'}
+        st.session_state.print_feedback = None
+
+    # -------------------------
+    # FEEDBACK DO PRINT (sempre visível no tab3)
+    # -------------------------
+    fb = st.session_state.print_feedback
+    if fb:
+        if fb["kind"] == "success":
+            st.success(fb["msg"])
+        elif fb["kind"] == "warning":
+            st.warning(fb["msg"])
+        else:
+            st.error(fb["msg"])
+
+    # -------------------------
+    # ENTRADA DA IMAGEM
+    # -------------------------
+    col1, col2 = st.columns(2)
+    with col1:
+        img_camera = st.camera_input("Tirar foto", key="foto_camera")
+    with col2:
+        img_upload = st.file_uploader("Carregar foto (PNG/JPG)", type=["png", "jpg", "jpeg"], key="foto_upload")
+
+    img_file = img_upload or img_camera
+    if img_file is not None:
+        st.session_state.foto_bytes = img_file.getvalue()
+
+    pil_img = None
+    if st.session_state.foto_bytes:
+        pil_img = Image.open(io.BytesIO(st.session_state.foto_bytes)).convert("RGB")
+
+    # -------------------------
+    # OCR + EXTRAÇÃO (só se houver imagem)
+    # -------------------------
+    if pil_img:
+        st.image(pil_img, caption="Imagem recebida", use_container_width=True)
+
+        usar_auto = st.toggle("Recortar automaticamente a rastreabilidade", value=True, key="toggle_auto_tab3")
+        pil_ocr = auto_crop_document(pil_img) if usar_auto else pil_img
+        st.image(pil_ocr, caption="Imagem usada no OCR", use_container_width=True)
+
+        with st.spinner("A ler o documento (OCR)..."):
+            texto = ocr_best_of_two(pil_ocr)
+
+        st.markdown("### Texto")
+        st.code(texto, language="text")
+
+        linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+
+        nome_extraido = extrair_nome_do_padroes(linhas)
+        lote = extrair_lote(linhas)
+        val_for = extrair_validade_ultimos4(linhas)
+
+        nome_sugerido = sugerir_produto_catalogo(nome_extraido or "", produtos)
+
+        st.markdown("### Campos detectados")
+        colA, colB = st.columns(2)
+        st.write("**Nome normalizado (para match):**", normalizar_nome_produto(nome_extraido or "") or "—")
+
+        with colA:
+            st.write("**Nome (OCR):**", nome_extraido or "—")
+            st.write("**Nome sugerido (catálogo):**", nome_sugerido or "—")
+        with colB:
+            st.write("**Lote:**", lote or "—")
+            st.write("**Validade fornecedor:**", val_for or "—")
+
+        st.markdown("---")
+        st.markdown("### Confirmar / ajustar")
+
+        nomes_catalogo = [p.nome for p in produtos]
+        nome_final = st.selectbox(
+            "Produto do catálogo",
+            options=nomes_catalogo,
+            index=nomes_catalogo.index(nome_sugerido) if nome_sugerido in nomes_catalogo else 0,
+            key="foto_produto_final",
+        )
+
+        lote_final = st.text_input("Lote", value=lote or "", key="foto_lote_final")
+        val_for_final = st.text_input("Validade do fornecedor", value=val_for or "", key="foto_valfor_final")
+
+        # -------------------------
+        # GERAR (ação)
+        # -------------------------
+        if st.button("Gerar validade (a partir da foto)", type="primary", key="btn_gerar_tab3"):
+            st.session_state.print_feedback = None  # limpa feedback anterior
+
+            for obj in produtos:
+                if obj.nome == nome_final:
+                    executar_tab3.nome = obj.nome
+                    executar_tab3.obs = obj.obs
+                    executar_tab3.exposto = obj.exposto
+                    break
+
+            executar_tab3.lote = lote_final
+            executar_tab3.val_for = val_for_final
+            executar_tab3.agora = datetime.now(TZ)
+            executar_tab3.validade = None
+
+            regra = (executar_tab3.exposto or "").lower()
+            dias = re.search(r"(\d+)\s*dias?", regra)
+            horas = re.search(r"(\d+)\s*horas?", regra)
+
+            if "produto do dia" in regra:
+                executar_tab3.validade = datetime(executar_tab3.agora.year, executar_tab3.agora.month, executar_tab3.agora.day, 23, 59, 59, tzinfo=TZ)
+            elif dias:
+                executar_tab3.validade = executar_tab3.agora + timedelta(days=int(dias.group(1)))
+            elif horas:
+                executar_tab3.validade = executar_tab3.agora + timedelta(hours=int(horas.group(1)))
+
+            dt_forn = parse_data_forn(executar_tab3.val_for)
+            if dt_forn and executar_tab3.validade and dt_forn < executar_tab3.validade:
+                executar_tab3.validade = dt_forn
+                executar_tab3.obs = (executar_tab3.obs or "")
+                if "Fornecedor limitou validade" not in executar_tab3.obs:
+                    executar_tab3.obs = (executar_tab3.obs + " | Fornecedor limitou validade").strip(" |")
+            elif dt_forn and not executar_tab3.validade:
+                executar_tab3.validade = dt_forn
+
+            st.session_state.foto_haccp_pronto = bool(executar_tab3.validade and (executar_tab3.lote or "").strip())
+
+    else:
+        st.info("Tira ou carrega uma foto para começar.")
+
+    # -------------------------
+    # RESULTADO + PRINT (NÃO depende de img_file / pil_img)
+    # -------------------------
+    if st.session_state.foto_haccp_pronto and executar_tab3.validade and (executar_tab3.lote or "").strip():
+        bloco = executar_tab3.texto_vizualizar_hccp()
+        st.success("Validade gerada com sucesso (por foto)!")
+        st.code(bloco, language="text")
+
+        imp_id = st.selectbox(
+            "Impressora Zebra",
+            options=list(ZEBRAS.keys()),
+            format_func=lambda k: f"{k} - {ZEBRAS[k]['nome']}",
+            key="zebra_select_tab3",
+        )
+
+        if st.button("Imprimir etiqueta", key="btn_print_tab3"):
+            zebra = ZEBRAS[imp_id]
+            zpl = build_haccp_zpl(executar_tab3, dpi=zebra["dpi"])
+
+            try:
+                send_zpl_to_zebra(zebra["ip"], zpl)
+                st.session_state.print_feedback = {
+                    "kind": "success",
+                    "msg": "Etiqueta enviada para a impressora com sucesso ✅"
+                }
+            except ConnectionError as e:
+                st.session_state.print_feedback = {
+                    "kind": "warning",
+                    "msg": f"⚠️ Não foi possível imprimir. Motivo: {str(e)}"
+                }
+            except Exception as e:
+                st.session_state.print_feedback = {
+                    "kind": "error",
+                    "msg": "❌ Erro inesperado ao tentar imprimir."
+                }
+                st.exception(e)
+
+        st.download_button(
+            "Baixar como TXT",
+            data=bloco.encode("utf-8"),
+            file_name=f"HCCP_{executar_tab3.nome[:20].replace(' ', '_')}_{executar_tab3.lote}_{executar_tab3.val_for}.txt",
+            mime="text/plain",
+            key="dl_txt_tab3",
+        )
