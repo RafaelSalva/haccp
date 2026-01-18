@@ -16,9 +16,13 @@ import cv2
 import pytesseract
 from rapidfuzz import process, fuzz
 import socket
+import shutil
+import pytesseract
 
+tcmd = os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
+if tcmd:
+    pytesseract.pytesseract.tesseract_cmd = tcmd
 
-pytesseract.pytesseract.tesseract_cmd = "/opt/local/bin/tesseract"
 
 
 TZ = ZoneInfo("Europe/Lisbon")
